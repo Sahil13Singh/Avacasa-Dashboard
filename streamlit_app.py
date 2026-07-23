@@ -642,17 +642,33 @@ Rules:
 
 SYNTHESIS_SYSTEM_PROMPT = """You are Avacasa's HP real estate knowledge assistant. Answer the user's question using ONLY the context chunks provided below. Be concise, factual, and specific to Himachal Pradesh. If the answer is not in the context, say "I don't have reliable data on that — please consult an HP property expert." Never make up statistics. Always end with a one-line source attribution."""
 
-# Tried in order — Gemini periodically retires older aliases, so if the first
-# candidate 404s we fall through to the next rather than silently giving up.
+# Static fallbacks tried first (cheap, no extra API call). If none of these
+# work for this key/library combo, we fall through to discovering whatever
+# models the key actually has access to via ListModels.
 GEMINI_MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+
+
+@st.cache_resource(show_spinner=False)
+def _discover_gemini_models() -> list[str]:
+    """Ask the API what this key can actually call, ranked flash-first (cheaper/faster)."""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    names = []
+    for m in genai.list_models():
+        if "generateContent" in getattr(m, "supported_generation_methods", []):
+            names.append(m.name.removeprefix("models/"))
+    names.sort(key=lambda n: (0 if "flash" in n else 1 if "pro" in n else 2, n))
+    return names
 
 
 def _call_gemini(system_instruction: str, prompt: str) -> str:
     """Try each candidate model until one responds. Raises the last error if all fail."""
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
+    tried = []
     last_err = None
     for model_name in GEMINI_MODEL_CANDIDATES:
+        tried.append(model_name)
         try:
             model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
             resp = model.generate_content(prompt)
@@ -660,7 +676,24 @@ def _call_gemini(system_instruction: str, prompt: str) -> str:
         except Exception as e:
             last_err = e
             continue
-    raise last_err
+
+    try:
+        discovered = _discover_gemini_models()
+    except Exception as e:
+        raise RuntimeError(f"tried {tried}, then ListModels failed: {e}") from (last_err or e)
+
+    for model_name in discovered:
+        if model_name in tried:
+            continue
+        tried.append(model_name)
+        try:
+            model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+            resp = model.generate_content(prompt)
+            return resp.text.strip()
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"tried {tried}, all failed. Last error: {last_err}") from last_err
 
 
 def classify_intent(query: str) -> dict:
