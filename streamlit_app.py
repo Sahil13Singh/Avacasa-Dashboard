@@ -642,6 +642,26 @@ Rules:
 
 SYNTHESIS_SYSTEM_PROMPT = """You are Avacasa's HP real estate knowledge assistant. Answer the user's question using ONLY the context chunks provided below. Be concise, factual, and specific to Himachal Pradesh. If the answer is not in the context, say "I don't have reliable data on that — please consult an HP property expert." Never make up statistics. Always end with a one-line source attribution."""
 
+# Tried in order — Gemini periodically retires older aliases, so if the first
+# candidate 404s we fall through to the next rather than silently giving up.
+GEMINI_MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+
+
+def _call_gemini(system_instruction: str, prompt: str) -> str:
+    """Try each candidate model until one responds. Raises the last error if all fail."""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    last_err = None
+    for model_name in GEMINI_MODEL_CANDIDATES:
+        try:
+            model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+            resp = model.generate_content(prompt)
+            return resp.text.strip()
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
+
 
 def classify_intent(query: str) -> dict:
     """Use Gemini to classify intent and extract params. Falls back to keyword heuristics."""
@@ -654,18 +674,13 @@ def classify_intent(query: str) -> dict:
 
     if GEMINI_API_KEY:
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel("gemini-1.5-flash",
-                                          system_instruction=INTENT_SYSTEM_PROMPT)
-            resp = model.generate_content(query)
-            raw = resp.text.strip()
+            raw = _call_gemini(INTENT_SYSTEM_PROMPT, query)
             raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
             parsed = json.loads(raw)
             parsed.setdefault("params", {})["query_text"] = query
             return parsed
-        except Exception:
-            pass
+        except Exception as e:
+            st.session_state["_gemini_last_error"] = f"intent: {e}"
 
     # ── Keyword fallback ──────────────────────────────────────────────────────
     q = query.lower()
@@ -733,14 +748,9 @@ def synthesize_market_qa(query: str, context_chunks: list[dict]) -> str:
 
     if GEMINI_API_KEY:
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel("gemini-1.5-flash",
-                                          system_instruction=SYNTHESIS_SYSTEM_PROMPT)
-            resp = model.generate_content(prompt)
-            return resp.text.strip()
-        except Exception:
-            pass
+            return _call_gemini(SYNTHESIS_SYSTEM_PROMPT, prompt)
+        except Exception as e:
+            st.session_state["_gemini_last_error"] = f"synthesis: {e}"
 
     # Fallback: concatenate context
     return context_str + f"\n\n*(Source: {', '.join(c['source'] for c in context_chunks)})*"
@@ -962,6 +972,10 @@ with st.sidebar:
 </div>
 <hr class='sidebar-divider'>
 """, unsafe_allow_html=True)
+
+    _gemini_err = st.session_state.get("_gemini_last_error")
+    if _gemini_err:
+        st.caption(f"⚠ Gemini call failed, showing raw context instead: {_gemini_err}")
 
     if _status.get("error") and not _model_ok:
         st.error(f"Error: {_status['error']}")
